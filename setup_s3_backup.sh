@@ -23,6 +23,10 @@ S3_REGION="us-east-1"
 # واستخدمه عند التعامل مع مزود S3 متوافق مثل Contabo أو Wasabi أو MinIO
 S3_ENDPOINT_URL=""
 
+# لـ MinIO أو بعض مزودي S3-compatible الذين لا يدعمون virtual-hosted style
+# اجعل القيمة true. اتركها false لـ AWS S3 و Contabo و Wasabi
+S3_PATH_STYLE="false"
+
 # نوع النسخ الاحتياطي: path | mysql | postgres
 BACKUP_MODE="path"
 
@@ -122,6 +126,9 @@ build_aws_args() {
     AWS_ARGS=()
     if [[ -n "${S3_ENDPOINT_URL// }" ]]; then
         AWS_ARGS+=(--endpoint-url "$S3_ENDPOINT_URL")
+    fi
+    if [[ "${S3_PATH_STYLE:-false}" == "true" ]]; then
+        AWS_ARGS+=(--path-style)
     fi
 }
 
@@ -306,6 +313,7 @@ S3_SECRET_KEY='$S3_SECRET_KEY'
 S3_BUCKET='$S3_BUCKET'
 S3_REGION='$S3_REGION'
 S3_ENDPOINT_URL='$S3_ENDPOINT_URL'
+S3_PATH_STYLE='$S3_PATH_STYLE'
 BACKUP_MODE='$BACKUP_MODE'
 SOURCE_PATH='$SOURCE_PATH'
 DB_NAME='$DB_NAME'
@@ -378,6 +386,11 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 fi
 source "$CONFIG_FILE"
 
+# تصدير بيانات اعتماد AWS CLI (مطلوبة لأوامر aws)
+export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY"
+export AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY"
+export AWS_DEFAULT_REGION="$S3_REGION"
+
 # -----------------------------------------------
 # الثوابت
 # -----------------------------------------------
@@ -393,6 +406,9 @@ LOCAL_BACKUP="$TEMP_DIR/$BACKUP_NAME"
 AWS_ARGS=()
 if [[ -n "${S3_ENDPOINT_URL// }" ]]; then
     AWS_ARGS+=(--endpoint-url "$S3_ENDPOINT_URL")
+fi
+if [[ "${S3_PATH_STYLE:-false}" == "true" ]]; then
+    AWS_ARGS+=(--path-style)
 fi
 
 S3_DEST_DIR="s3://${S3_BUCKET}/${S3_BACKUP_PREFIX}/${HOSTNAME}"
@@ -492,7 +508,7 @@ s3_upload_with_retry() {
     local wait_time=5
 
     while [[ $attempt -le $max_attempts ]]; do
-        if aws s3 cp "$source" "$dest" --region "$S3_REGION" "${AWS_ARGS[@]}" 2>/dev/null; then
+        if aws s3 cp "$source" "$dest" --region "$S3_REGION" "${AWS_ARGS[@]}"; then
             return 0
         fi
         if [[ $attempt -lt $max_attempts ]]; then
@@ -807,6 +823,11 @@ run_test_backup() {
         echo -e "${RED}[خطأ]${NC} لم يتم الحصول على اسم النسخة من سكربت النسخ" >&2
         return 1
     fi
+
+    # تصدير بيانات اعتماد AWS CLI
+    export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY"
+    export AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY"
+    export AWS_DEFAULT_REGION="$S3_REGION"
 
     # الحصول على حجم النسخة من S3
     build_aws_args
