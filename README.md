@@ -31,7 +31,7 @@
 ### 0. استنساخ المستودع
 
 ```bash
-git clone https://github.com/your-username/s3-sh.git
+git clone https://github.com/Baron-Systems/s3-sh.git
 cd s3-sh
 ```
 
