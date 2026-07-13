@@ -417,7 +417,6 @@ fi
 # الثوابت
 # -----------------------------------------------
 LOG_FILE="$SCRIPT_DIR/backup.log"
-log_msg "نمط عنوان S3: $AWS_S3_ADDRESSING_STYLE"
 LOCK_FILE="$SCRIPT_DIR/backup.lock"
 HOSTNAME="$(hostname)"
 DATE_NOW="$(date +%Y-%m-%d_%H-%M-%S)"
@@ -763,6 +762,7 @@ do_backup() {
 
     log_msg "========================================"
     log_msg "بدء عملية النسخ الاحتياطي"
+    log_msg "نمط عنوان S3: $AWS_S3_ADDRESSING_STYLE"
     log_msg "النوع: $BACKUP_MODE"
     log_msg "اسم الملف: $BACKUP_FILENAME"
     log_msg "S3_KEY: $S3_KEY"
