@@ -417,6 +417,7 @@ fi
 # الثوابت
 # -----------------------------------------------
 LOG_FILE="$SCRIPT_DIR/backup.log"
+log_msg "نمط عنوان S3: $AWS_S3_ADDRESSING_STYLE"
 LOCK_FILE="$SCRIPT_DIR/backup.lock"
 HOSTNAME="$(hostname)"
 DATE_NOW="$(date +%Y-%m-%d_%H-%M-%S)"
@@ -582,16 +583,34 @@ verify_upload() {
     log_msg "حجم الملف المحلي: $local_size بايت"
 
     local s3_size
-    s3_size=$(aws s3api head-object \
+    local head_stderr="$SCRIPT_DIR/.head_stderr"
+    s3_size=$(AWS_S3_ADDRESSING_STYLE="$AWS_S3_ADDRESSING_STYLE" aws s3api head-object \
         --bucket "$S3_BUCKET" \
         --key "$s3_key" \
         --query "ContentLength" \
         --output text \
         --region "$S3_REGION" \
-        "${AWS_ARGS[@]}" 2>/dev/null) || {
+        "${AWS_ARGS[@]}" 2>"$head_stderr") || {
         log_msg "خطأ: فشل التحقق من وجود النسخة على S3 (المفتاح: $s3_key)"
+        if [[ -s "$head_stderr" ]]; then
+            log_msg "تفاصيل خطأ head-object: $(tr '\n' ' ' < "$head_stderr")"
+        fi
+        rm -f "$head_stderr"
+
+        # Fallback: التحقق من الوجود باستخدام aws s3 ls عندما يفشل s3api
+        local backup_filename
+        backup_filename=$(basename "$s3_key")
+        log_msg "محاولة fallback للتحقق من الوجود عبر aws s3 ls..."
+        if aws s3 ls "s3://${S3_BUCKET}/${S3_BACKUP_PREFIX}/${HOSTNAME}/" \
+            --region "$S3_REGION" \
+            "${AWS_ARGS[@]}" 2>/dev/null | grep -q "${backup_filename}$"; then
+            log_msg "تحذير: head-object فشل، لكن النسخة موجودة على S3 (تم التحقق بواسطة s3 ls)"
+            return 0
+        fi
+
         return 1
     }
+    rm -f "$head_stderr"
 
     if [[ -z "$s3_size" || "$s3_size" == "None" || "$s3_size" == "null" ]]; then
         log_msg "خطأ: النسخة غير موجودة على S3 (ContentLength فارغ)"
