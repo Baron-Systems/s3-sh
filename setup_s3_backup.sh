@@ -412,6 +412,7 @@ fi
 
 S3_DEST_DIR="s3://${S3_BUCKET}/${S3_BACKUP_PREFIX}/${HOSTNAME}"
 S3_KEY_PREFIX="${S3_BACKUP_PREFIX}/${HOSTNAME}"
+BACKUP_KEY="${S3_KEY_PREFIX}/${BACKUP_NAME}"
 
 # -----------------------------------------------
 # دوال مساعدة
@@ -545,6 +546,8 @@ s3_head_with_retry() {
 verify_upload() {
     local local_file="$1"
     local s3_key="$2"
+
+    log_msg "جاري التحقق من المفتاح: $s3_key"
 
     local local_size
     local_size=$(stat -c%s "$local_file" 2>/dev/null || stat -f%z "$local_file" 2>/dev/null)
@@ -713,8 +716,8 @@ log_msg "تم إنشاء النسخة المحلية بنجاح (الحجم: ${l
 # -----------------------------------------------
 # رفع النسخة إلى S3 مع إعادة المحاولة
 # -----------------------------------------------
-log_msg "جاري الرفع إلى S3: $S3_DEST_DIR/$BACKUP_NAME"
-if ! s3_upload_with_retry "$LOCAL_BACKUP" "$S3_DEST_DIR/$BACKUP_NAME"; then
+log_msg "جاري الرفع إلى S3: s3://${S3_BUCKET}/${BACKUP_KEY}"
+if ! s3_upload_with_retry "$LOCAL_BACKUP" "s3://${S3_BUCKET}/${BACKUP_KEY}"; then
     log_msg "خطأ: فشل رفع النسخة إلى S3 بعد كل المحاولات"
     exit 1
 fi
@@ -723,8 +726,8 @@ log_msg "تم الرفع بنجاح"
 # -----------------------------------------------
 # التحقق من نجاح الرفع (وجود + تطابق الحجم)
 # -----------------------------------------------
-log_msg "جاري التحقق من النسخة على S3..."
-if ! verify_upload "$LOCAL_BACKUP" "${S3_KEY_PREFIX}/${BACKUP_NAME}"; then
+log_msg "جاري التحقق من النسخة على S3: $BACKUP_KEY"
+if ! verify_upload "$LOCAL_BACKUP" "$BACKUP_KEY"; then
     log_msg "خطأ: فشل التحقق من النسخة على S3"
     exit 1
 fi
