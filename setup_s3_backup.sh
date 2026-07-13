@@ -127,9 +127,6 @@ build_aws_args() {
     if [[ -n "${S3_ENDPOINT_URL// }" ]]; then
         AWS_ARGS+=(--endpoint-url "$S3_ENDPOINT_URL")
     fi
-    if [[ "${S3_PATH_STYLE:-false}" == "true" ]]; then
-        AWS_ARGS+=(--path-style)
-    fi
 }
 
 # ==================================================
@@ -391,6 +388,11 @@ export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY"
 export AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY"
 export AWS_DEFAULT_REGION="$S3_REGION"
 
+# فرض path-style addressing في MinIO (لا يوجد --path-style في AWS CLI)
+if [[ "${S3_PATH_STYLE:-false}" == "true" ]]; then
+    export AWS_S3_ADDRESSING_STYLE=path
+fi
+
 # -----------------------------------------------
 # الثوابت
 # -----------------------------------------------
@@ -406,9 +408,6 @@ LOCAL_BACKUP="$TEMP_DIR/$BACKUP_NAME"
 AWS_ARGS=()
 if [[ -n "${S3_ENDPOINT_URL// }" ]]; then
     AWS_ARGS+=(--endpoint-url "$S3_ENDPOINT_URL")
-fi
-if [[ "${S3_PATH_STYLE:-false}" == "true" ]]; then
-    AWS_ARGS+=(--path-style)
 fi
 
 S3_DEST_DIR="s3://${S3_BUCKET}/${S3_BACKUP_PREFIX}/${HOSTNAME}"
@@ -867,7 +866,11 @@ show_helper_commands() {
     echo "    sudo cat $CRON_FILE"
     echo ""
     echo "  عرض النسخ على S3:"
-    echo "    aws s3 ls $S3_DEST_DIR/ --region $S3_REGION ${AWS_ARGS[*]}"
+    if [[ "${S3_PATH_STYLE:-false}" == "true" ]]; then
+        echo "    AWS_S3_ADDRESSING_STYLE=path aws s3 ls $S3_DEST_DIR/ --region $S3_REGION ${AWS_ARGS[*]}"
+    else
+        echo "    aws s3 ls $S3_DEST_DIR/ --region $S3_REGION ${AWS_ARGS[*]}"
+    fi
 }
 
 # ==================================================
@@ -925,6 +928,12 @@ main() {
     check_root
     validate_settings
     build_aws_args
+
+    # فرض path-style addressing في MinIO
+    if [[ "${S3_PATH_STYLE:-false}" == "true" ]]; then
+        export AWS_S3_ADDRESSING_STYLE=path
+    fi
+
     install_dependencies
     setup_backup_dir
     write_config_file
