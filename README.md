@@ -9,6 +9,8 @@
 - **توافق كامل** مع AWS S3 و Contabo Object Storage و Wasabi و MinIO
 - **تحقق ثلاثي** من نجاح الرفع (وجود + حجم + تطابق)
 - **حذف تلقائي** للنسخ القديمة مع الاحتفاظ بآخر `N` نسخ
+- **استعادة سهلة** لنسخة محددة أو آخر نسخة (`--restore` / `--restore-latest`)
+- **عرض قائمة النسخ** على S3 (`--list`)
 - **إعادة محاولة تلقائية** عند فشل الشبكة مع Exponential Backoff
 - **فحص المساحة الحرة** قبل إنشاء الأرشيف
 - **logrotate** لإدارة السجلات تلقائياً
@@ -89,6 +91,9 @@ S3_ENDPOINT_URL="https://eu2.contabostorage.com"
 S3_ENDPOINT_URL="https://s3.wasabisys.com"
 # أو
 S3_ENDPOINT_URL="https://minio.example.com"
+
+# يُفضّل تفعيل path-style لمعظم مزودي S3-compatible
+S3_PATH_STYLE="true"
 ```
 
 ### 2. تشغيل السكربت
@@ -216,7 +221,17 @@ sudo tail -n 50 /root/.s3-backup/backup.log
 sudo cat /etc/cron.d/s3-daily-backup
 
 # عرض النسخ على S3
-aws s3 ls s3://my-backups/website-backups/my-server/ --region us-east-1
+sudo /root/.s3-backup/backup.sh --list
+
+# استعادة نسخة محددة
+sudo /root/.s3-backup/backup.sh --restore backup-2026-07-13_14-54-49.tar.gz /path/to/restore
+
+# استعادة آخر نسخة
+sudo /root/.s3-backup/backup.sh --restore-latest /path/to/restore
+
+# أو عبر سكربت الإعداد:
+sudo bash setup_s3_backup.sh --restore backup-2026-07-13_14-54-49.tar.gz /path/to/restore
+sudo bash setup_s3_backup.sh --restore latest /path/to/restore
 
 # إعادة تشغيل الإعداد (يحدّث Cron إذا تغير الوقت فقط)
 sudo bash setup_s3_backup.sh

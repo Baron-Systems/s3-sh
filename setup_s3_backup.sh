@@ -16,16 +16,18 @@ umask 077
 S3_ACCESS_KEY="ضع_access_key_هنا"
 S3_SECRET_KEY="ضع_secret_key_هنا"
 
-S3_BUCKET="اسم-bucket"
+S3_BUCKET="shop"
 S3_REGION="us-east-1"
 
 # اتركه فارغاً عند استخدام Amazon AWS S3
 # واستخدمه عند التعامل مع مزود S3 متوافق مثل Contabo أو Wasabi أو MinIO
-S3_ENDPOINT_URL=""
+S3_ENDPOINT_URL="https://s3.mby-solution.vip"
 
-# لـ MinIO أو بعض مزودي S3-compatible الذين لا يدعمون virtual-hosted style
-# اجعل القيمة true. اتركها false لـ AWS S3 و Contabo و Wasabi
-S3_PATH_STYLE="false"
+# true  = path-style addressing (مطلوب لمعظم مزودي S3-compatible)
+# false = virtual-hosted style (لـ AWS S3 فقط)
+# ملاحظة: AWS CLI v2 لا يدعم الخيار --path-style، بل يستخدم:
+#         export AWS_S3_ADDRESSING_STYLE=path
+S3_PATH_STYLE="true"
 
 # نوع النسخ الاحتياطي: path | mysql | postgres
 BACKUP_MODE="path"
@@ -86,9 +88,11 @@ log_msg() {
 }
 
 error_exit() {
-    echo -e "${RED}[خطأ]${NC} $1" >&2
+    local msg="$1"
+    local code="${2:-1}"
+    echo -e "${RED}[خطأ]${NC} $msg" >&2
     echo -e "${RED}راجع ملف السجل: $LOG_FILE${NC}" >&2
-    exit 1
+    exit "$code"
 }
 
 # -----------------------------------------------
@@ -126,6 +130,14 @@ build_aws_args() {
     AWS_ARGS=()
     if [[ -n "${S3_ENDPOINT_URL// }" ]]; then
         AWS_ARGS+=(--endpoint-url "$S3_ENDPOINT_URL")
+    fi
+}
+
+configure_addressing_style() {
+    if [[ "${S3_PATH_STYLE:-false}" == "true" ]]; then
+        export AWS_S3_ADDRESSING_STYLE=path
+    else
+        export AWS_S3_ADDRESSING_STYLE=virtual
     fi
 }
 
@@ -229,6 +241,11 @@ validate_settings() {
 
     if ! [[ "$CRON_MINUTE" =~ ^[0-9]+$ ]] || [[ "$CRON_MINUTE" -lt 0 ]] || [[ "$CRON_MINUTE" -gt 59 ]]; then
         echo -e "${RED}[خطأ] CRON_MINUTE يجب أن يكون بين 0 و 59.${NC}" >&2
+        has_error=1
+    fi
+
+    if [[ "$S3_PATH_STYLE" != "true" && "$S3_PATH_STYLE" != "false" ]]; then
+        echo -e "${RED}[خطأ] S3_PATH_STYLE يجب أن يكون true أو false.${NC}" >&2
         has_error=1
     fi
 
@@ -364,7 +381,7 @@ write_backup_script() {
 #!/usr/bin/env bash
 
 # ============================================================
-# سكربت النسخ الاحتياطي اليومي إلى S3
+# سكربت النسخ الاحتياطي والاستعادة إلى S3
 # Production Ready — لا تعدل هذا الملف مباشرة
 # ============================================================
 
@@ -383,14 +400,17 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 fi
 source "$CONFIG_FILE"
 
-# تصدير بيانات اعتماد AWS CLI (مطلوبة لأوامر aws)
+# تصدير بيانات اعتماد AWS CLI
 export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY"
 export AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY"
 export AWS_DEFAULT_REGION="$S3_REGION"
 
-# فرض path-style addressing في MinIO (لا يوجد --path-style في AWS CLI)
+# ضبط نمط العنوان (path-style vs virtual-hosted)
+# AWS CLI لا يدعم الخيار --path-style، بل يستخدم متغير البيئة هذا
 if [[ "${S3_PATH_STYLE:-false}" == "true" ]]; then
     export AWS_S3_ADDRESSING_STYLE=path
+else
+    export AWS_S3_ADDRESSING_STYLE=virtual
 fi
 
 # -----------------------------------------------
@@ -398,9 +418,11 @@ fi
 # -----------------------------------------------
 LOG_FILE="$SCRIPT_DIR/backup.log"
 LOCK_FILE="$SCRIPT_DIR/backup.lock"
+HOSTNAME="$(hostname)"
 DATE_NOW="$(date +%Y-%m-%d_%H-%M-%S)"
-BACKUP_NAME="backup-${DATE_NOW}.tar.gz"
-LOCAL_BACKUP="$TEMP_DIR/$BACKUP_NAME"
+BACKUP_FILENAME="backup-${DATE_NOW}.tar.gz"
+S3_KEY="${S3_BACKUP_PREFIX}/${HOSTNAME}/${BACKUP_FILENAME}"
+LOCAL_BACKUP="$TEMP_DIR/$BACKUP_FILENAME"
 
 # -----------------------------------------------
 # بناء مصفوفة وسائط AWS (بدون eval)
@@ -410,19 +432,33 @@ if [[ -n "${S3_ENDPOINT_URL// }" ]]; then
     AWS_ARGS+=(--endpoint-url "$S3_ENDPOINT_URL")
 fi
 
-S3_DEST_DIR="s3://${S3_BUCKET}/${S3_BACKUP_PREFIX}/${HOSTNAME}"
-S3_KEY_PREFIX="${S3_BACKUP_PREFIX}/${HOSTNAME}"
-BACKUP_KEY="${S3_KEY_PREFIX}/${BACKUP_NAME}"
-
 # -----------------------------------------------
 # دوال مساعدة
 # -----------------------------------------------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
 log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
 }
 
+print_msg() {
+    echo -e "$1"
+    log_msg "$2"
+}
+
+error_exit() {
+    local msg="$1"
+    local code="${2:-1}"
+    log_msg "[ERROR] $msg"
+    echo -e "${RED}[خطأ]${NC} $msg" >&2
+    exit "$code"
+}
+
 # -----------------------------------------------
-# Improved Trap
+# Trap محسّن
 # -----------------------------------------------
 error_trap() {
     local line_no="$1"
@@ -435,7 +471,7 @@ error_trap() {
     fi
 
     log_msg "========================================"
-    log_msg "حدث خطأ في سكربت النسخ الاحتياطي"
+    log_msg "حدث خطأ في سكربت النسخ/الاستعادة"
     log_msg "السطر: $line_no"
     log_msg "الأمر: $failed_cmd"
     log_msg "رمز الخطأ: $exit_code"
@@ -451,18 +487,22 @@ trap 'error_trap $LINENO "$BASH_COMMAND" $? "${FUNCNAME[*]}"' ERR
 # التنظيف عند الخروج
 # -----------------------------------------------
 cleanup() {
-    rm -f "$LOCAL_BACKUP"
+    if [[ -n "${LOCAL_BACKUP:-}" ]] && [[ -f "$LOCAL_BACKUP" ]]; then
+        rm -f "$LOCAL_BACKUP"
+    fi
 }
 trap cleanup EXIT
 
 # -----------------------------------------------
 # منع تشغيل أكثر من نسخة في نفس الوقت
 # -----------------------------------------------
-exec 200>"$LOCK_FILE"
-if ! flock -n 200; then
-    log_msg "خطأ: هناك نسخة أخرى من النسخ الاحتياطي تعمل حالياً"
-    exit 1
-fi
+acquire_lock() {
+    exec 200>"$LOCK_FILE"
+    if ! flock -n 200; then
+        log_msg "خطأ: هناك نسخة أخرى من النسخ الاحتياطي تعمل حالياً"
+        exit 1
+    fi
+}
 
 # -----------------------------------------------
 # فحص المساحة الحرة
@@ -477,7 +517,6 @@ check_disk_space() {
         return 1
     }
 
-    # إضافة 30% احتياطي للضغط والملفات المؤقتة
     local required_space=$((source_size + (source_size * 30 / 100)))
 
     local available_space
@@ -498,7 +537,7 @@ check_disk_space() {
 }
 
 # -----------------------------------------------
-# إعادة المحاولة مع Exponential Backoff
+# رفع مع إعادة المحاولة
 # -----------------------------------------------
 s3_upload_with_retry() {
     local source="$1"
@@ -508,7 +547,9 @@ s3_upload_with_retry() {
     local wait_time=5
 
     while [[ $attempt -le $max_attempts ]]; do
+        log_msg "محاولة الرفع $attempt/$max_attempts إلى: $dest"
         if aws s3 cp "$source" "$dest" --region "$S3_REGION" "${AWS_ARGS[@]}"; then
+            log_msg "نجح الرفع في المحاولة $attempt"
             return 0
         fi
         if [[ $attempt -lt $max_attempts ]]; then
@@ -518,25 +559,7 @@ s3_upload_with_retry() {
         fi
         ((attempt++))
     done
-    return 1
-}
-
-s3_head_with_retry() {
-    local key="$1"
-    local max_attempts=3
-    local attempt=1
-    local wait_time=5
-
-    while [[ $attempt -le $max_attempts ]]; do
-        if aws s3api head-object --bucket "$S3_BUCKET" --key "$key" --region "$S3_REGION" "${AWS_ARGS[@]}" >/dev/null 2>&1; then
-            return 0
-        fi
-        if [[ $attempt -lt $max_attempts ]]; then
-            sleep "$wait_time"
-            wait_time=$((wait_time * 2))
-        fi
-        ((attempt++))
-    done
+    log_msg "فشل الرفع بعد $max_attempts محاولات"
     return 1
 }
 
@@ -556,6 +579,7 @@ verify_upload() {
         log_msg "خطأ: فشل قراءة حجم الملف المحلي"
         return 1
     fi
+    log_msg "حجم الملف المحلي: $local_size بايت"
 
     local s3_size
     s3_size=$(aws s3api head-object \
@@ -565,12 +589,12 @@ verify_upload() {
         --output text \
         --region "$S3_REGION" \
         "${AWS_ARGS[@]}" 2>/dev/null) || {
-        log_msg "خطأ: فشل التحقق من وجود النسخة على S3"
+        log_msg "خطأ: فشل التحقق من وجود النسخة على S3 (المفتاح: $s3_key)"
         return 1
     }
 
-    if [[ -z "$s3_size" || "$s3_size" == "None" ]]; then
-        log_msg "خطأ: النسخة غير موجودة على S3"
+    if [[ -z "$s3_size" || "$s3_size" == "None" || "$s3_size" == "null" ]]; then
+        log_msg "خطأ: النسخة غير موجودة على S3 (ContentLength فارغ)"
         return 1
     fi
 
@@ -584,16 +608,17 @@ verify_upload() {
 }
 
 # -----------------------------------------------
-# حذف النسخ القديمة باستخدام s3api list-objects-v2
-# والاعتماد على LastModified بدلاً من اسم الملف
+# حذف النسخ القديمة
 # -----------------------------------------------
 delete_old_backups() {
     log_msg "جاري تطبيق سياسة الاحتفاظ (الاحتفاظ بآخر $KEEP_BACKUPS نسخ)..."
 
+    local prefix="${S3_BACKUP_PREFIX}/${HOSTNAME}/"
+
     local objects
     objects=$(aws s3api list-objects-v2 \
         --bucket "$S3_BUCKET" \
-        --prefix "${S3_KEY_PREFIX}/backup-" \
+        --prefix "$prefix" \
         --query "Contents[?ends_with(Key, '.tar.gz')].[Key,LastModified]" \
         --output text \
         --region "$S3_REGION" \
@@ -604,7 +629,6 @@ delete_old_backups() {
         return 0
     fi
 
-    # ترتيب النسخ من الأحدث إلى الأقدم حسب LastModified
     mapfile -t sorted_keys < <(echo "$objects" | sort -k2 -r | awk '{print $1}')
 
     local total_count=${#sorted_keys[@]}
@@ -615,7 +639,6 @@ delete_old_backups() {
         return 0
     fi
 
-    # حذف النسخ الزائدة (تخطي أول KEEP_BACKUPS نسخ الأحدث)
     for ((i = KEEP_BACKUPS; i < total_count; i++)); do
         local old_key="${sorted_keys[$i]}"
         log_msg "حذف النسخة القديمة: $old_key"
@@ -627,126 +650,246 @@ delete_old_backups() {
     log_msg "تم حذف النسخ القديمة (بقيت $KEEP_BACKUPS نسخ)"
 }
 
-# ==================================================
-# بدء عملية النسخ الاحتياطي
-# ==================================================
+# -----------------------------------------------
+# قائمة النسخ على S3
+# -----------------------------------------------
+list_backups() {
+    local prefix="${S3_BACKUP_PREFIX}/${HOSTNAME}/"
+    log_msg "عرض قائمة النسخ: s3://${S3_BUCKET}/${prefix}"
 
-log_msg "========================================"
-log_msg "بدء عملية النسخ الاحتياطي"
-log_msg "النوع: $BACKUP_MODE"
-
-mkdir -p "$TEMP_DIR"
-chmod 700 "$TEMP_DIR"
+    aws s3 ls "s3://${S3_BUCKET}/${prefix}" --region "$S3_REGION" "${AWS_ARGS[@]}"
+}
 
 # -----------------------------------------------
-# إنشاء النسخة حسب BACKUP_MODE
+# استعادة نسخة محددة
 # -----------------------------------------------
-case "$BACKUP_MODE" in
-    path)
-        log_msg "المصدر: $SOURCE_PATH"
-        log_msg "وجهة S3: $S3_DEST_DIR/"
+restore_backup() {
+    local backup_filename="$1"
+    local destination="$2"
+    local key="${S3_BACKUP_PREFIX}/${HOSTNAME}/${backup_filename}"
 
-        if [[ ! -e "$SOURCE_PATH" ]]; then
-            log_msg "خطأ: المسار المصدر غير موجود: $SOURCE_PATH"
-            exit 1
+    if [[ -z "$backup_filename" ]]; then
+        error_exit "يجب تحديد اسم ملف النسخة" 2
+    fi
+
+    if [[ -z "$destination" ]]; then
+        error_exit "يجب تحديد مسار الوجهة المحلية" 3
+    fi
+
+    mkdir -p "$destination"
+
+    log_msg "========================================"
+    log_msg "بدء استعادة النسخة"
+    log_msg "اسم الملف: $backup_filename"
+    log_msg "S3_KEY: $key"
+    log_msg "الوجهة: $destination"
+
+    print_msg "${YELLOW}[*]${NC} جاري تنزيل النسخة من S3..." "جاري تنزيل النسخة من S3: s3://${S3_BUCKET}/${key}"
+
+    if ! aws s3 cp "s3://${S3_BUCKET}/${key}" "$destination/$backup_filename" --region "$S3_REGION" "${AWS_ARGS[@]}"; then
+        error_exit "فشل تنزيل النسخة من S3" 4
+    fi
+
+    print_msg "${GREEN}[✓]${NC} تم تنزيل النسخة بنجاح" "تم تنزيل النسخة بنجاح: $destination/$backup_filename"
+
+    if [[ "$backup_filename" == *.tar.gz ]]; then
+        print_msg "${YELLOW}[*]${NC} جاري فك ضغط النسخة..." "جاري فك ضغط النسخة في: $destination"
+        if ! tar -xzf "$destination/$backup_filename" -C "$destination"; then
+            error_exit "فشل فك ضغط النسخة" 5
         fi
+        print_msg "${GREEN}[✓]${NC} تم فك ضغط النسخة بنجاح" "تم فك ضغط النسخة بنجاح"
+    fi
 
-        check_disk_space "$SOURCE_PATH" "$TEMP_DIR" || exit 1
+    log_msg "========================================"
+}
 
-        SOURCE_DIR="$(dirname "$SOURCE_PATH")"
-        SOURCE_BASE="$(basename "$SOURCE_PATH")"
+# -----------------------------------------------
+# استعادة آخر نسخة
+# -----------------------------------------------
+restore_latest() {
+    local destination="$1"
+    local prefix="${S3_BACKUP_PREFIX}/${HOSTNAME}/"
 
-        log_msg "جاري إنشاء الأرشيف: $BACKUP_NAME"
-        cd "$SOURCE_DIR"
-        tar -czf "$LOCAL_BACKUP" "$SOURCE_BASE" 2>/dev/null
+    if [[ -z "$destination" ]]; then
+        error_exit "يجب تحديد مسار الوجهة المحلية" 3
+    fi
+
+    log_msg "البحث عن آخر نسخة في: s3://${S3_BUCKET}/${prefix}"
+
+    local latest_key
+    latest_key=$(aws s3api list-objects-v2 \
+        --bucket "$S3_BUCKET" \
+        --prefix "$prefix" \
+        --query "sort_by(Contents[?ends_with(Key, '.tar.gz')], &LastModified)[-1].Key" \
+        --output text \
+        --region "$S3_REGION" \
+        "${AWS_ARGS[@]}" 2>/dev/null)
+
+    if [[ -z "$latest_key" || "$latest_key" == "None" ]]; then
+        error_exit "لم يتم العثور على نسخ احتياطية" 6
+    fi
+
+    local backup_filename
+    backup_filename=$(basename "$latest_key")
+
+    log_msg "آخر نسخة: $backup_filename"
+    restore_backup "$backup_filename" "$destination"
+}
+
+# -----------------------------------------------
+# النسخ الاحتياطي الرئيسي
+# -----------------------------------------------
+do_backup() {
+    acquire_lock
+
+    log_msg "========================================"
+    log_msg "بدء عملية النسخ الاحتياطي"
+    log_msg "النوع: $BACKUP_MODE"
+    log_msg "اسم الملف: $BACKUP_FILENAME"
+    log_msg "S3_KEY: $S3_KEY"
+
+    mkdir -p "$TEMP_DIR"
+    chmod 700 "$TEMP_DIR"
+
+    # -----------------------------------------------
+    # إنشاء النسخة حسب BACKUP_MODE
+    # -----------------------------------------------
+    case "$BACKUP_MODE" in
+        path)
+            log_msg "المصدر: $SOURCE_PATH"
+            log_msg "وجهة S3: s3://${S3_BUCKET}/${S3_BACKUP_PREFIX}/${HOSTNAME}/"
+
+            if [[ ! -e "$SOURCE_PATH" ]]; then
+                log_msg "خطأ: المسار المصدر غير موجود: $SOURCE_PATH"
+                exit 1
+            fi
+
+            check_disk_space "$SOURCE_PATH" "$TEMP_DIR" || exit 1
+
+            local source_dir source_base
+            source_dir="$(dirname "$SOURCE_PATH")"
+            source_base="$(basename "$SOURCE_PATH")"
+
+            log_msg "جاري إنشاء الأرشيف: $BACKUP_FILENAME"
+            (cd "$source_dir" && tar -czf "$LOCAL_BACKUP" "$source_base" 2>/dev/null)
+            ;;
+
+        mysql)
+            log_msg "قاعدة البيانات: $DB_NAME@$DB_HOST:$DB_PORT"
+            log_msg "وجهة S3: s3://${S3_BUCKET}/${S3_BACKUP_PREFIX}/${HOSTNAME}/"
+
+            log_msg "جاري تصدير قاعدة البيانات (mysqldump)..."
+            if ! mysqldump \
+                --host="$DB_HOST" \
+                --port="$DB_PORT" \
+                --user="$DB_USER" \
+                --password="$DB_PASSWORD" \
+                --single-transaction \
+                --routines \
+                --triggers \
+                --events \
+                --set-gtid-purged=OFF \
+                "$DB_NAME" 2>/dev/null | gzip > "$LOCAL_BACKUP"; then
+                log_msg "خطأ: فشل تصدير قاعدة البيانات"
+                exit 1
+            fi
+            log_msg "تم تصدير وضغط قاعدة البيانات بنجاح"
+            ;;
+
+        postgres)
+            log_msg "قاعدة البيانات: $DB_NAME@$DB_HOST:$DB_PORT"
+            log_msg "وجهة S3: s3://${S3_BUCKET}/${S3_BACKUP_PREFIX}/${HOSTNAME}/"
+
+            log_msg "جاري تصدير قاعدة البيانات (pg_dump)..."
+            if ! PGPASSWORD="$DB_PASSWORD" pg_dump \
+                --host="$DB_HOST" \
+                --port="$DB_PORT" \
+                --username="$DB_USER" \
+                --no-password \
+                --no-owner \
+                "$DB_NAME" 2>/dev/null | gzip > "$LOCAL_BACKUP"; then
+                log_msg "خطأ: فشل تصدير قاعدة البيانات"
+                exit 1
+            fi
+            log_msg "تم تصدير وضغط قاعدة البيانات بنجاح"
+            ;;
+    esac
+
+    # -----------------------------------------------
+    # التحقق من إنشاء الملف المحلي
+    # -----------------------------------------------
+    if [[ ! -f "$LOCAL_BACKUP" ]]; then
+        error_exit "فشل إنشاء ملف النسخ الاحتياطي" 10
+    fi
+
+    local local_size
+    local_size=$(stat -c%s "$LOCAL_BACKUP" 2>/dev/null || stat -f%z "$LOCAL_BACKUP" 2>/dev/null)
+    log_msg "تم إنشاء النسخة المحلية بنجاح (الحجم: ${local_size} بايت)"
+
+    # -----------------------------------------------
+    # رفع النسخة إلى S3 مع إعادة المحاولة
+    # -----------------------------------------------
+    log_msg "جاري الرفع إلى S3: s3://${S3_BUCKET}/${S3_KEY}"
+    if ! s3_upload_with_retry "$LOCAL_BACKUP" "s3://${S3_BUCKET}/${S3_KEY}"; then
+        error_exit "فشل رفع النسخة إلى S3 بعد كل المحاولات" 11
+    fi
+    print_msg "${GREEN}[✓]${NC} تم الرفع بنجاح" "تم الرفع بنجاح: s3://${S3_BUCKET}/${S3_KEY}"
+
+    # -----------------------------------------------
+    # التحقق من نجاح الرفع (وجود + تطابق الحجم)
+    # -----------------------------------------------
+    log_msg "جاري التحقق من النسخة على S3: $S3_KEY"
+    if ! verify_upload "$LOCAL_BACKUP" "$S3_KEY"; then
+        error_exit "فشل التحقق من النسخة على S3" 12
+    fi
+    print_msg "${GREEN}[✓]${NC} تم التحقق من النسخة على S3" "تم التحقق من النسخة على S3: $S3_KEY"
+
+    # -----------------------------------------------
+    # حذف النسخ القديمة
+    # -----------------------------------------------
+    delete_old_backups
+
+    log_msg "انتهت عملية النسخ الاحتياطي بنجاح: $BACKUP_FILENAME"
+    log_msg "========================================"
+
+    # إخراج اسم النسخة ليتمكن سكربت الإعداد من التقاطه
+    echo "$BACKUP_FILENAME"
+    exit 0
+}
+
+# -----------------------------------------------
+# نقطة الدخول
+# -----------------------------------------------
+case "${1:-}" in
+    --restore)
+        restore_backup "${2:-}" "${3:-}"
         ;;
-
-    mysql)
-        log_msg "قاعدة البيانات: $DB_NAME@$DB_HOST:$DB_PORT"
-        log_msg "وجهة S3: $S3_DEST_DIR/"
-
-        log_msg "جاري تصدير قاعدة البيانات (mysqldump)..."
-        if ! mysqldump \
-            --host="$DB_HOST" \
-            --port="$DB_PORT" \
-            --user="$DB_USER" \
-            --password="$DB_PASSWORD" \
-            --single-transaction \
-            --routines \
-            --triggers \
-            --events \
-            --set-gtid-purged=OFF \
-            "$DB_NAME" 2>/dev/null | gzip > "$LOCAL_BACKUP"; then
-            log_msg "خطأ: فشل تصدير قاعدة البيانات"
-            exit 1
-        fi
-        log_msg "تم تصدير وضغط قاعدة البيانات بنجاح"
+    --restore-latest)
+        restore_latest "${2:-}"
         ;;
-
-    postgres)
-        log_msg "قاعدة البيانات: $DB_NAME@$DB_HOST:$DB_PORT"
-        log_msg "وجهة S3: $S3_DEST_DIR/"
-
-        log_msg "جاري تصدير قاعدة البيانات (pg_dump)..."
-        if ! PGPASSWORD="$DB_PASSWORD" pg_dump \
-            --host="$DB_HOST" \
-            --port="$DB_PORT" \
-            --username="$DB_USER" \
-            --no-password \
-            --no-owner \
-            "$DB_NAME" 2>/dev/null | gzip > "$LOCAL_BACKUP"; then
-            log_msg "خطأ: فشل تصدير قاعدة البيانات"
-            exit 1
-        fi
-        log_msg "تم تصدير وضغط قاعدة البيانات بنجاح"
+    --list)
+        list_backups
+        ;;
+    "")
+        do_backup
+        ;;
+    --help|-h)
+        echo "Usage: $0 [--restore <backup-file> <destination>] [--restore-latest <destination>] [--list]"
+        exit 0
+        ;;
+    *)
+        error_exit "وسيط غير معروف: $1" 13
         ;;
 esac
-
-# -----------------------------------------------
-# التحقق من إنشاء الملف المحلي
-# -----------------------------------------------
-if [[ ! -f "$LOCAL_BACKUP" ]]; then
-    log_msg "خطأ: فشل إنشاء ملف النسخ الاحتياطي"
-    exit 1
-fi
-
-local_size=$(stat -c%s "$LOCAL_BACKUP" 2>/dev/null || stat -f%z "$LOCAL_BACKUP" 2>/dev/null)
-log_msg "تم إنشاء النسخة المحلية بنجاح (الحجم: ${local_size} بايت)"
-
-# -----------------------------------------------
-# رفع النسخة إلى S3 مع إعادة المحاولة
-# -----------------------------------------------
-log_msg "جاري الرفع إلى S3: s3://${S3_BUCKET}/${BACKUP_KEY}"
-if ! s3_upload_with_retry "$LOCAL_BACKUP" "s3://${S3_BUCKET}/${BACKUP_KEY}"; then
-    log_msg "خطأ: فشل رفع النسخة إلى S3 بعد كل المحاولات"
-    exit 1
-fi
-log_msg "تم الرفع بنجاح"
-
-# -----------------------------------------------
-# التحقق من نجاح الرفع (وجود + تطابق الحجم)
-# -----------------------------------------------
-log_msg "جاري التحقق من النسخة على S3: $BACKUP_KEY"
-if ! verify_upload "$LOCAL_BACKUP" "$BACKUP_KEY"; then
-    log_msg "خطأ: فشل التحقق من النسخة على S3"
-    exit 1
-fi
-
-# -----------------------------------------------
-# حذف النسخ القديمة
-# -----------------------------------------------
-delete_old_backups
-
-log_msg "انتهت عملية النسخ الاحتياطي بنجاح: $BACKUP_NAME"
-log_msg "========================================"
-
-# إخراج اسم النسخة ليتمكن سكربت الإعداد من التقاطه
-echo "$BACKUP_NAME"
-
-exit 0
 BACKUP_EOF
 
     chmod 700 "$BACKUP_SCRIPT"
+
+    if ! bash -n "$BACKUP_SCRIPT"; then
+        echo -e "${RED}[خطأ]${NC} سكربت النسخ يحتوي على أخطاء نحوية" >&2
+        return 1
+    fi
+
     echo -e "${GREEN}[✓]${NC} تم إنشاء سكربت النسخ: $BACKUP_SCRIPT"
 }
 
@@ -826,16 +969,21 @@ run_test_backup() {
         return 1
     fi
 
+    local TEST_S3_KEY="${S3_BACKUP_PREFIX}/${HOSTNAME}/${TEST_BACKUP_NAME}"
+    echo -e "${YELLOW}[*]${NC} اسم الملف: $TEST_BACKUP_NAME"
+    echo -e "${YELLOW}[*]${NC} S3_KEY: $TEST_S3_KEY"
+
     # تصدير بيانات اعتماد AWS CLI
     export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY"
     export AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY"
     export AWS_DEFAULT_REGION="$S3_REGION"
+    configure_addressing_style
 
     # الحصول على حجم النسخة من S3
     build_aws_args
     TEST_BACKUP_SIZE=$(aws s3api head-object \
         --bucket "$S3_BUCKET" \
-        --key "${S3_BACKUP_PREFIX}/${HOSTNAME}/${TEST_BACKUP_NAME}" \
+        --key "$TEST_S3_KEY" \
         --query "ContentLength" \
         --output text \
         --region "$S3_REGION" \
@@ -847,6 +995,7 @@ run_test_backup() {
 
     echo ""
     echo -e "${GREEN}[✓]${NC} تم رفع النسخة التجريبية بنجاح: $TEST_BACKUP_NAME"
+    echo -e "${GREEN}[✓]${NC} حجم النسخة على S3: $TEST_BACKUP_SIZE"
     return 0
 }
 
@@ -856,6 +1005,7 @@ run_test_backup() {
 
 show_helper_commands() {
     build_aws_args
+    configure_addressing_style
 
     echo ""
     echo "أوامر مفيدة:"
@@ -869,11 +1019,13 @@ show_helper_commands() {
     echo "    sudo cat $CRON_FILE"
     echo ""
     echo "  عرض النسخ على S3:"
-    if [[ "${S3_PATH_STYLE:-false}" == "true" ]]; then
-        echo "    AWS_S3_ADDRESSING_STYLE=path aws s3 ls $S3_DEST_DIR/ --region $S3_REGION ${AWS_ARGS[*]}"
-    else
-        echo "    aws s3 ls $S3_DEST_DIR/ --region $S3_REGION ${AWS_ARGS[*]}"
-    fi
+    echo "    AWS_S3_ADDRESSING_STYLE=$AWS_S3_ADDRESSING_STYLE aws s3 ls $S3_DEST_DIR/ --region $S3_REGION ${AWS_ARGS[*]}"
+    echo ""
+    echo "  استعادة نسخة محددة:"
+    echo "    sudo $BACKUP_SCRIPT --restore backup-YYYY-MM-DD_HH-MM-SS.tar.gz /path/to/restore"
+    echo ""
+    echo "  استعادة آخر نسخة:"
+    echo "    sudo $BACKUP_SCRIPT --restore-latest /path/to/restore"
 }
 
 # ==================================================
@@ -921,21 +1073,79 @@ print_failure() {
 }
 
 # ==================================================
+# استعادة نسخة احتياطية عبر سكربت النسخ
+# ==================================================
+
+run_restore() {
+    local backup_filename="$1"
+    local destination="$2"
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        error_exit "لم يتم العثور على ملف الإعدادات: $CONFIG_FILE"
+    fi
+
+    source "$CONFIG_FILE"
+
+    export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY"
+    export AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY"
+    export AWS_DEFAULT_REGION="$S3_REGION"
+    configure_addressing_style
+
+    if [[ ! -f "$BACKUP_SCRIPT" ]]; then
+        error_exit "لم يتم العثور على سكربت النسخ: $BACKUP_SCRIPT"
+    fi
+
+    if [[ "$backup_filename" == "--latest" || "$backup_filename" == "latest" ]]; then
+        "$BACKUP_SCRIPT" --restore-latest "$destination"
+    else
+        "$BACKUP_SCRIPT" --restore "$backup_filename" "$destination"
+    fi
+}
+
+print_usage() {
+    echo "Usage: $0 [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  (no args)        تشغيل الإعداد أو إعادة الإعداد"
+    echo "  --restore <file> <dest>   استعادة نسخة محددة"
+    echo "  --restore latest <dest>   استعادة آخر نسخة"
+    echo "  --help, -h                عرض هذه الرسالة"
+}
+
+# ==================================================
 # نقطة الدخول الرئيسية
 # ==================================================
 
 main() {
+    case "${1:-}" in
+        --help|-h)
+            print_usage
+            exit 0
+            ;;
+        --restore)
+            check_root
+            if [[ -z "${2:-}" || -z "${3:-}" ]]; then
+                print_usage >&2
+                error_exit "يجب تحديد اسم النسخة والوجهة"
+            fi
+            run_restore "$2" "$3"
+            exit $?
+            ;;
+        "")
+            : # متابعة الإعداد
+            ;;
+        *)
+            error_exit "وسيط غير معروف: $1"
+            ;;
+    esac
+
     echo -e "${YELLOW}[*]${NC} بدء إعداد النسخ الاحتياطي إلى S3..."
     echo ""
 
     check_root
     validate_settings
     build_aws_args
-
-    # فرض path-style addressing في MinIO
-    if [[ "${S3_PATH_STYLE:-false}" == "true" ]]; then
-        export AWS_S3_ADDRESSING_STYLE=path
-    fi
+    configure_addressing_style
 
     install_dependencies
     setup_backup_dir
